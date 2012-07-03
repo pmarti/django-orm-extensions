@@ -31,7 +31,7 @@ class ArrayField(models.Field):
 
     def get_db_prep_value(self, value, connection, prepared=False):
         value = value if prepared else self.get_prep_value(value)
-        if not value:
+        if not value or isinstance(value, basestring):
             return value
 
         if self._array_type in ('text') or "varchar" in self._array_type:
