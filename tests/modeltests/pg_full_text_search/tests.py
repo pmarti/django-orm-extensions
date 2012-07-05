@@ -23,14 +23,13 @@ class TestFts(TestCase):
 
     def test_self_update_index(self):
         obj = Person2.objects.create(
-            name=u'Pèpâ',
+            name=u'Pepa',
             description=u"Is a housewife",
         )
-        obj.update_index()
+        obj.update_search_field()
 
         qs = Person2.objects.search(query="Pepa")
         self.assertEqual(qs.count(), 1)
-
 
     def test_self_automatic_update_index(self):
         obj = Person3(
@@ -75,7 +74,7 @@ class TestFts(TestCase):
         self.assertEqual(qs2.count(), 1)
         self.assertEqual(qs3.count(), 2)
         self.assertEqual(qs4.count(), 0)
-    
+
     def test_update_indexes(self):
         self.p1.name = 'Francisco'
         self.p1.save()
@@ -86,7 +85,7 @@ class TestFts(TestCase):
     def test_transaction_test(self):
         class TestException(Exception):
             pass
-        
+
         p = Person3(
             name='Andrei1',
             description='description1',

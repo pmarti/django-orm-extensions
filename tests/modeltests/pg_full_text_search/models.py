@@ -12,6 +12,7 @@ class Person(models.Model):
     objects = FtsManager(
         fields=('name', 'description'),
         search_field = 'search_index',
+        config = 'names',
     )
 
     def __unicode__(self):
@@ -19,8 +20,7 @@ class Person(models.Model):
 
     def save(self, *args, **kwargs):
         super(Person, self).save(*args, **kwargs)
-        if hasattr(self, '_orm_manager'):
-            self._orm_manager.update_index(pk=self.pk)
+        self.update_search_field()
 
 
 class Person2(models.Model):
@@ -31,6 +31,7 @@ class Person2(models.Model):
     objects = FtsManager(
         fields=('name', 'description'),
         search_field = 'search_index',
+        config = 'names',
     )
 
     def __unicode__(self):
@@ -45,7 +46,8 @@ class Person3(models.Model):
     objects = FtsManager(
         fields=('name', 'description'),
         search_field = 'search_index',
-        auto_update_index = True,
+        auto_update_search_field = True,
+        config = 'names'
     )
 
     def __unicode__(self):

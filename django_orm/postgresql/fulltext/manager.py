@@ -5,82 +5,160 @@ from itertools import repeat
 from django.utils.encoding import force_unicode
 from django.db import models, connections, transaction
 
-def auto_update_index_handler(sender, instance, *args, **kwargs):
-    sender._orm_manager.update_index(pk=instance.pk, using=kwargs['using'])
+def auto_update_search_field_handler(sender, instance, *args, **kwargs):
+    instance.update_search_field()
 
 class SearchManagerMixIn(object):
-    vector_field = None
+    '''
+    A mixin to create a Manager with a 'search' method that may do a full text search
+    on the model.
 
-    def __init__(self, fields=None, search_field='search_index', 
-                                    config='pg_catalog.english',
-                                    auto_update_index = False):
-        self.fields = None
+    The manager is set up with a list of one or more model's fields that will be searched.
+    It can be a list of field names, or a list of tuples (field_name, weight). It can also
+    be None, in that case every CharField and TextField in the model will be searched.
+
+    You can also give a 'search_field', a VectorField into where the values of the searched
+    fields are copied and normalized. If you give it, the searches will be made on this
+    field; if not, they will be made directly in the searched fields.
+
+    When using search_field, if auto_update = True, Django signals will be used to
+    automatically syncronize the search_field with the searched fields every time instances
+    are saved. If not, you can call to 'update_search_field' method in model instances to do this.
+    If search_field not used, both auto_update and update_search_field does nothing. Alternatively,
+    you can create a postgresql trigger to do the syncronization at database level, see this:
+
+    http://www.postgresql.org/docs/9.1/interactive/textsearch-features.html#TEXTSEARCH-UPDATE-TRIGGERS
+
+    In both cases, you should create a text search index, on either the searched fields or
+    the compound search_field, like explained here:
+
+    http://www.postgresql.org/docs/9.1/interactive/textsearch-tables.html#TEXTSEARCH-TABLES-INDEX
+
+    Finally, you can give a 'config', the Postgres text search configuration that will be used
+    to normalize the search_field and the queries. How do you can create a configuration:
+
+    http://www.postgresql.org/docs/9.1/interactive/textsearch-configuration.html
+
+    To do all those actions in database, create a setup sql script for Django:
+
+    https://docs.djangoproject.com/en/1.4/howto/initial-data/#providing-initial-sql-data
+    '''
+
+    def __init__(self, fields=None, search_field='search_index',
+            config='pg_catalog.english', auto_update_search_field=False):
+
         if fields is not None:
             if isinstance(fields, (list, tuple)):
                 if len(fields) > 0 and isinstance(fields[0], (list,tuple)):
                     self.fields = fields
                 else:
                     self.fields = [(x, None) for x in fields]
+        else:
+            self.fields = self._find_text_fields()
 
-        self.vector_field = search_field
-        self.default_weight = 'A'
+        self.search_field = search_field
+        self.default_weight = 'D'
         self.config = config
-        self.auto_update_index = auto_update_index
+        self.auto_update_search_field = auto_update_search_field
+
         super(SearchManagerMixIn, self).__init__()
 
     def contribute_to_class(self, cls, name):
-        # Add instance method for update index.
-        _update_index = lambda x: x._orm_manager.update_index(pk=x.pk)
-        setattr(cls, 'update_index', _update_index)
+        '''
+        Called automatically by Django when setting up the model class.
+        '''
 
-        # Set auto update if need
-        if self.auto_update_index:
-            models.signals.post_save.connect(auto_update_index_handler, sender=cls)
+        # Attach this manager as _orm_manager in the model class.
+        if not getattr(cls, '_orm_manager', None):
+            cls._orm_manager = self
+
+        # Add 'update_search_field' instance method, that calls manager's update_search_field.
+        if not getattr(cls, 'update_search_field', None):
+            _update_search_field = lambda x: x._orm_manager.update_search_field(pk=x.pk)
+            setattr(cls, 'update_search_field', _update_search_field)
+
+        if self.auto_update_search_field:
+            models.signals.post_save.connect(auto_update_search_field_handler, sender=cls)
 
         super(SearchManagerMixIn, self).contribute_to_class(cls, name)
 
-    def _find_fields(self):
-        """
-        Search all text fields.
-        """
 
-        fields = [f for f in self.model._meta.fields 
-            if isinstance(f,(models.CharField,models.TextField))]
+    def search(self, query, rank_field=None, rank_function='ts_rank',
+                rank_normalization=32, config=None, raw=False, using=None):
+        '''
+        Convert query with to_tsquery or plainto_tsquery, depending on raw is
+        True or False, and return a QuerySet with the filter.
 
-        return [f.name for f in fields]
+        If rank_field is not none, a field with this name will be added containing the
+        search rank of the instances, and the queryset will be ordered by it. The
+        rank_function and normalization are explained here:
 
-    def _vector_sql(self, field, weight=None, config=None, using=None):
-        if not weight:
-            weight = self.default_weight
+        http://www.postgresql.org/docs/9.1/interactive/textsearch-controls.html#TEXTSEARCH-RANKING
+
+        If an empty query is given, no filter is made so the QuerySet will return
+        all model instances.
+        '''
+
         if not config:
             config = self.config
-        f = self.model._meta.get_field(field)
 
-        using = using if using is not None else self.db
-        connection = connections[using]
+        db_alias = using if using is not None else self.db
+        connection = connections[db_alias]
         qn = connection.ops.quote_name
-        sql_template = "setweight(to_tsvector('%s', coalesce(unaccent(%s), '')), '%s')"
-        return sql_template % (config, qn(f.column), weight)
 
-    def update_index(self, pk=None, config=None, using=None):
+        qs = self.all()
+        if using is not None:
+            qs = qs.using(using)
+
+        if query:
+            function = "to_tsquery" if raw else "plainto_tsquery"
+            ts_query = "%s('%s', '%s')" % (
+                function,
+                config,
+                force_unicode(query).replace("'","''")
+            )
+            if self.search_field:
+                search_vector = qn(self.search_field)
+            else:
+                search_vector = self._get_search_vector(config, using)
+            where = " (%s) @@ (%s)" % (search_vector, ts_query)
+
+            select_dict, order = {}, []
+            if rank_field:
+                select_dict[rank_field] = '%s(%s, %s, %d)' % (
+                    rank_function,
+                    qn(self.search_field),
+                    ts_query,
+                    rank_normalization
+                )
+                order = ['-%s' % (rank_field,)]
+
+            qs = qs.extra(select=select_dict, where=[where], order_by=order)
+
+        return qs
+
+    def update_search_field(self, pk=None, config=None, using=None):
+        '''
+        Update the search_field of one instance, or a list of instances, or
+        all instances in the table (pk is one key, a list of keys or none).
+
+        If there is no search_field, this function does nothing.
+        '''
+
+        if not self.search_field:
+            return
+
+        if not config:
+            config = self.config
+
         if using is None:
             using = self.db
 
-        sql_instances = []
-
-        if not self.fields:
-            self.fields = self._find_fields()
-
-        sql_instances = [self._vector_sql(field, weight, config, using) \
-            for field, weight in self.fields]
-
-        vector_sql = ' || '.join(sql_instances)
-        where_sql = ''
-        params = []
-
         connection = connections[using]
         qn = connection.ops.quote_name
 
+        where_sql = ''
+        params = []
         if pk is not None:
             if isinstance(pk, (list, tuple)):
                 params = pk
@@ -92,10 +170,11 @@ class SearchManagerMixIn(object):
                 ','.join(repeat("%s", len(params)))
             )
 
+        search_vector = self._get_search_vector(config, using)
         sql = "UPDATE %s SET %s = %s %s;" % (
             qn(self.model._meta.db_table),
-            qn(self.vector_field),
-            vector_sql,
+            qn(self.search_field),
+            search_vector,
             where_sql
         )
 
@@ -117,35 +196,32 @@ class SearchManagerMixIn(object):
             if forced_managed:
                 transaction.leave_transaction_management(using=using)
 
+    def _find_text_fields(self):
+        fields = [f for f in self.model._meta.fields
+                  if isinstance(f, (models.CharField, models.TextField))]
 
-    def search(self, query, rank_field=None, rank_normalization=32, config=None,
-               raw=False, using=None):
+        return [(f.name, None) for f in fields]
+
+    def _get_search_vector(self, config, using):
+        search_vector = []
+        for field_name, weight in self.fields:
+            search_vector.append(self._get_vector_for_field(field_name, weight, config, using))
+        return ' || '.join(search_vector)
+
+    def _get_vector_for_field(self, field_name, weight=None, config=None, using=None):
+        if not weight:
+            weight = self.default_weight
 
         if not config:
             config = self.config
 
-        db_alias = using if using is not None else self.db
-        connection = connections[db_alias]
+        if using is None:
+            using = self.db
+
+        field = self.model._meta.get_field(field_name)
+
+        connection = connections[using]
         qn = connection.ops.quote_name
 
-        function = "to_tsquery" if raw else "plainto_tsquery"
-        ts_query = "%s('%s', unaccent('%s'))" % (
-            function,
-            config,
-            force_unicode(query).replace("'","''")
-        )
-        where = " %s @@ %s" % (qn(self.vector_field), ts_query)
-
-        select_dict, order = {}, []
-        if rank_field:
-            select_dict[rank_field] = 'ts_rank(%s, %s, %d)' % (
-                qn(self.vector_field),
-                ts_query, rank_normalization
-            )
-            order = ['-%s' % (rank_field,)]
-
-        qs = self.all()
-        if using is not None:
-            qs = qs.using(using)
-
-        return qs.extra(select=select_dict, where=[where], order_by=order)
+        return "setweight(to_tsvector('%s', coalesce(%s, '')), '%s')" % \
+                                          (config, qn(field.column), weight)
