@@ -46,20 +46,11 @@ class SearchManagerMixIn(object):
 
     def __init__(self, fields=None, search_field='search_index',
             config='pg_catalog.english', auto_update_search_field=False):
-
-        if fields is not None:
-            if isinstance(fields, (list, tuple)):
-                if len(fields) > 0 and isinstance(fields[0], (list,tuple)):
-                    self.fields = fields
-                else:
-                    self.fields = [(x, None) for x in fields]
-        else:
-            self.fields = self._find_text_fields()
-
         self.search_field = search_field
         self.default_weight = 'D'
         self.config = config
         self.auto_update_search_field = auto_update_search_field
+        self._fields = fields
 
         super(SearchManagerMixIn, self).__init__()
 
@@ -83,13 +74,13 @@ class SearchManagerMixIn(object):
         super(SearchManagerMixIn, self).contribute_to_class(cls, name)
 
 
-    def search(self, query, rank_field=None, rank_function='ts_rank',
-                rank_normalization=32, config=None, raw=False, using=None):
+    def search(self, query, rank_field=None, rank_function='ts_rank', config=None,
+                rank_normalization=32, raw=False, using=None, fields=None):
         '''
         Convert query with to_tsquery or plainto_tsquery, depending on raw is
-        True or False, and return a QuerySet with the filter.
+        `True` or `False`, and return a QuerySet with the filter.
 
-        If rank_field is not none, a field with this name will be added containing the
+        If `rank_field` is not `None`, a field with this name will be added containing the
         search rank of the instances, and the queryset will be ordered by it. The
         rank_function and normalization are explained here:
 
@@ -97,6 +88,9 @@ class SearchManagerMixIn(object):
 
         If an empty query is given, no filter is made so the QuerySet will return
         all model instances.
+
+        If `fields` is not `None`, the filter is made  with this fields istead of
+        defined on a constructor of manager.
         '''
 
         if not config:
@@ -117,13 +111,24 @@ class SearchManagerMixIn(object):
                 config,
                 force_unicode(query).replace("'","''")
             )
-            if self.search_field:
-                search_vector = qn(self.search_field)
-            else:
-                search_vector = self._get_search_vector(config, using)
-            where = " (%s) @@ (%s)" % (search_vector, ts_query)
 
+            # if fields is passed, obtain a vector expression with
+            # these fields. In other case, intent use of search_field if
+            # exists.
+            if fields:
+                search_vector = self._get_search_vector(config, using, fields=fields)
+            else:
+                if not self.search_field:
+                    raise ValueError("search_field is not specified")
+
+                search_vector = "%s.%s" % (
+                    qn(self.model._meta.db_table),
+                    qn(self.search_field)
+                )
+
+            where = " (%s) @@ (%s)" % (search_vector, ts_query)
             select_dict, order = {}, []
+
             if rank_field:
                 select_dict[rank_field] = '%s(%s, %s, %d)' % (
                     rank_function,
@@ -202,9 +207,39 @@ class SearchManagerMixIn(object):
 
         return [(f.name, None) for f in fields]
 
-    def _get_search_vector(self, config, using):
+    def _parse_fields(self, fields):
+        """
+        Parse fields list into a correct format needed by this manager.
+        If any field does not exist, raise ValueError.
+        """
+
+        parsed_fields = set()
+
+        if fields is not None and isinstance(fields, (list, tuple)):
+            if len(fields) > 0 and isinstance(fields[0], (list,tuple)):
+                parsed_fields.update(fields)
+            else:
+                parsed_fields.update([(x, None) for x in fields])
+
+            # Does not support field.attname.
+            field_names = set((field.name, None) for field in self.model._meta.fields if not field.primary_key)
+            non_model_fields = parsed_fields.difference(field_names)
+            if non_model_fields:
+                raise ValueError("The following fields do not exist in this"
+                                 " model: {0}".format(", ".join(x[0] for x in non_model_fields)))
+        else:
+            parsed_fields.update(self._find_text_fields())
+
+        return parsed_fields
+
+    def _get_search_vector(self, config, using, fields=None):
+        if fields is None:
+            vector_fields = self._parse_fields(self._fields)
+        else:
+            vector_fields = self._parse_fields(fields)
+
         search_vector = []
-        for field_name, weight in self.fields:
+        for field_name, weight in vector_fields:
             search_vector.append(self._get_vector_for_field(field_name, weight, config, using))
         return ' || '.join(search_vector)
 
@@ -223,5 +258,5 @@ class SearchManagerMixIn(object):
         connection = connections[using]
         qn = connection.ops.quote_name
 
-        return "setweight(to_tsvector('%s', coalesce(%s, '')), '%s')" % \
-                                          (config, qn(field.column), weight)
+        return "setweight(to_tsvector('%s', coalesce(%s.%s, '')), '%s')" % \
+                    (config, qn(self.model._meta.db_table), qn(field.column), weight)

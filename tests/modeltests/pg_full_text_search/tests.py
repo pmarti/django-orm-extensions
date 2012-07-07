@@ -64,6 +64,13 @@ class TestFts(TestCase):
         self.assertEqual(qs2.count(), 1)
         self.assertEqual(qs3.count(), 0)
 
+    def test_search_with_fields_params(self):
+        qs1 = Person.objects.search(query="Andrei & programmer", raw=True, fields=['name'])
+        qs2 = Person.objects.search(query="Andrei & programmer", raw=True, fields=['name', 'description'])
+
+        self.assertEqual(qs1.count(), 0)
+        self.assertEqual(qs2.count(), 1)
+
     def test_search_or(self):
         qs1 = Person.objects.search(query="Andrei | Pepa", raw=True)
         qs2 = Person.objects.search(query="Andrei | Pepo", raw=True)
